@@ -1,0 +1,2617 @@
+import asyncio
+import logging
+import sqlite3
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+import json
+
+# Настройки бота
+BOT_TOKEN = "8261105884:AAErE78hJRbZkvdXTYyv3qdHTGM7dwxT7vY"
+ADMIN_ID = 7871475865
+SUPPORT_USERNAME = "@izmony"
+
+# Обязательная подписка
+REQUIRED_CHANNEL = {
+    "id": "-1002895358183",
+    "username": "@ProfitMaker557",
+    "name": "Наш канал"
+}
+
+# Настройки бота
+MIN_DEPOSIT = 1.0
+MIN_WITHDRAWAL = 10.0
+MIN_COLLECT = 1.0
+REFERRAL_PERCENT_INVEST = 15
+REFERRAL_PERCENT_WITHDRAW = 0.5
+PROFIT_PERCENT = 8.0
+BOT_USERNAME = "@ProfitMakerPro_bot"
+
+# Награды за активности
+REWARD_PRICES = {
+    "post": 50.0,
+    "video": 100.0,
+    "story": 25.0,
+    "review": 30.0
+}
+
+# Реквизиты для оплаты
+PAYMENT_DETAILS = {
+    "sbp": {
+        "bank": "Сбербанк",
+        "phone": "+79592741128",
+        "recipient": "Сергей К."
+    },
+    "card": {
+        "bank": "Сбербанк",
+        "card_number": "2202208205962757",
+        "recipient": "Сергей К."
+    },
+    "payeer": {
+        "account": "P1128063300",
+        "wallet": "RUB",
+        "link": "payeer.com"
+    }
+}
+
+# Инициализация бота
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# Словарь для хранения активных таймеров
+active_timers = {}
+
+# Состояния FSM
+class UserStates(StatesGroup):
+    waiting_deposit_amount = State()
+    waiting_withdraw_amount = State()
+    waiting_withdraw_method = State()
+    waiting_calc_amount = State()
+    waiting_deposit_method = State()
+    waiting_invest_amount = State()
+    waiting_support_message = State()
+    waiting_reward_proof = State()
+
+class AdminStates(StatesGroup):
+    waiting_broadcast = State()
+    waiting_deposit_user_id = State()
+    waiting_deposit_amount = State()
+    waiting_freeze_user_id = State()
+    waiting_freeze_reason = State()
+    waiting_block_user_id = State()
+    waiting_block_reason = State()
+    waiting_bot_token = State()
+    waiting_admin_id = State()
+    waiting_min_deposit = State()
+    waiting_min_withdrawal = State()
+    waiting_min_collect = State()
+    waiting_profit_percent = State()
+    waiting_referral_invest = State()
+    waiting_referral_withdraw = State()
+    waiting_bot_username = State()
+    waiting_support_username = State()
+    waiting_channel_id = State()
+    waiting_channel_username = State()
+    waiting_channel_name = State()
+    waiting_payment_details = State()
+    waiting_payment_type = State()
+    waiting_reward_price = State()
+    waiting_reward_type = State()
+
+# База данных
+class Database:
+    def __init__(self):
+        self.conn = sqlite3.connect('invest_bot.db', check_same_thread=False)
+        self.create_tables()
+
+    def create_tables(self):
+        cursor = self.conn.cursor()
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                balance REAL DEFAULT 0,
+                ref_balance REAL DEFAULT 0,
+                total_invested REAL DEFAULT 0,
+                total_earned REAL DEFAULT 0,
+                referral_id INTEGER,
+                referrals_count INTEGER DEFAULT 0,
+                notifications_enabled INTEGER DEFAULT 1,
+                has_subscribed INTEGER DEFAULT 0,
+                is_blocked INTEGER DEFAULT 0,
+                is_frozen INTEGER DEFAULT 0,
+                freeze_reason TEXT,
+                block_reason TEXT,
+                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS investments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount REAL,
+                accumulated REAL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active INTEGER DEFAULT 1,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                operation TEXT,
+                amount REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS withdrawal_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount REAL,
+                method TEXT,
+                details TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS deposit_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                amount REAL,
+                method TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS support_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                message TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS reward_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                reward_type TEXT,
+                proof_text TEXT,
+                amount REAL,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                setting_name TEXT UNIQUE,
+                setting_value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        self.conn.commit()
+        print("✅ База данных инициализирована")
+
+    def save_setting(self, name, value):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'INSERT OR REPLACE INTO bot_settings (setting_name, setting_value) VALUES (?, ?)',
+            (name, str(value))
+        )
+        self.conn.commit()
+
+    def get_setting(self, name, default=None):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT setting_value FROM bot_settings WHERE setting_name = ?', (name,))
+        result = cursor.fetchone()
+        if result:
+            return result[0]
+        return default
+
+    def get_all_settings(self):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT setting_name, setting_value FROM bot_settings')
+        return {row[0]: row[1] for row in cursor.fetchall()}
+
+    def add_user(self, user_id, username, first_name, referral_id=None):
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                'INSERT OR IGNORE INTO users (user_id, username, first_name, referral_id) VALUES (?, ?, ?, ?)',
+                (user_id, username, first_name, referral_id)
+            )
+            if referral_id:
+                cursor.execute(
+                    'UPDATE users SET referrals_count = referrals_count + 1 WHERE user_id = ?',
+                    (referral_id,)
+                )
+            self.conn.commit()
+        except Exception as e:
+            print(f"Error adding user: {e}")
+
+    def get_user(self, user_id):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+        return cursor.fetchone()
+
+    def update_balance(self, user_id, amount):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'UPDATE users SET balance = balance + ? WHERE user_id = ?', (amount, user_id))
+        self.conn.commit()
+
+    def freeze_user(self, user_id, reason):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'UPDATE users SET is_frozen = 1, freeze_reason = ? WHERE user_id = ?',
+            (reason, user_id)
+        )
+        self.conn.commit()
+
+    def unfreeze_user(self, user_id):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'UPDATE users SET is_frozen = 0, freeze_reason = NULL WHERE user_id = ?',
+            (user_id,)
+        )
+        self.conn.commit()
+
+    def block_user(self, user_id, reason):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'UPDATE users SET is_blocked = 1, block_reason = ? WHERE user_id = ?',
+            (reason, user_id)
+        )
+        self.conn.commit()
+
+    def unblock_user(self, user_id):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'UPDATE users SET is_blocked = 0, block_reason = NULL WHERE user_id = ?',
+            (user_id,)
+        )
+        self.conn.commit()
+
+    def add_investment(self, user_id, amount):
+        cursor = self.conn.cursor()
+        current_investment = self.get_active_investment(user_id)
+
+        if current_investment:
+            new_amount = current_investment[2] + amount
+            cursor.execute(
+                'UPDATE investments SET amount = ? WHERE id = ?',
+                (new_amount, current_investment[0])
+            )
+        else:
+            cursor.execute(
+                'INSERT INTO investments (user_id, amount) VALUES (?, ?)',
+                (user_id, amount)
+            )
+
+        cursor.execute(
+            'UPDATE users SET total_invested = total_invested + ? WHERE user_id = ?',
+            (amount, user_id)
+        )
+        self.conn.commit()
+
+    def get_active_investment(self, user_id):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT * FROM investments WHERE user_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 1',
+            (user_id,)
+        )
+        return cursor.fetchone()
+
+    def update_investment_accumulated(self, investment_id, accumulated):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'UPDATE investments SET accumulated = ?, last_updated = ? WHERE id = ?',
+            (accumulated, datetime.now(), investment_id)
+        )
+        self.conn.commit()
+
+    def reset_investment_accumulated(self, investment_id):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'UPDATE investments SET accumulated = 0, last_updated = ? WHERE id = ?',
+            (datetime.now(), investment_id)
+        )
+        self.conn.commit()
+
+    def add_operation(self, user_id, operation, amount):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'INSERT INTO operations (user_id, operation, amount) VALUES (?, ?, ?)',
+            (user_id, operation, amount)
+        )
+        self.conn.commit()
+
+    def get_recent_operations(self, limit=5):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT u.user_id, o.operation, o.amount, o.created_at
+            FROM operations o
+            JOIN users u ON o.user_id = u.user_id
+            ORDER BY o.created_at DESC
+            LIMIT ?
+        ''', (limit,))
+        return cursor.fetchall()
+
+    def add_withdrawal_request(self, user_id, amount, method, details):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'INSERT INTO withdrawal_requests (user_id, amount, method, details) VALUES (?, ?, ?, ?)',
+            (user_id, amount, method, details)
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_pending_withdrawals(self):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT wr.*, u.username, u.first_name
+            FROM withdrawal_requests wr
+            JOIN users u ON wr.user_id = u.user_id
+            WHERE wr.status = 'pending'
+        ''')
+        return cursor.fetchall()
+
+    def get_withdrawal_by_id(self, withdrawal_id):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT wr.*, u.username, u.first_name
+            FROM withdrawal_requests wr
+            JOIN users u ON wr.user_id = u.user_id
+            WHERE wr.id = ?
+        ''', (withdrawal_id,))
+        return cursor.fetchone()
+
+    def update_withdrawal_status(self, withdrawal_id, status):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'UPDATE withdrawal_requests SET status = ? WHERE id = ?',
+            (status, withdrawal_id)
+        )
+        self.conn.commit()
+
+    def add_deposit_request(self, user_id, amount, method):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'INSERT INTO deposit_requests (user_id, amount, method) VALUES (?, ?, ?)',
+            (user_id, amount, method)
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_pending_deposits(self):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT dr.*, u.username, u.first_name
+            FROM deposit_requests dr
+            JOIN users u ON dr.user_id = u.user_id
+            WHERE dr.status = 'pending'
+        ''')
+        return cursor.fetchall()
+
+    def get_deposit_by_id(self, deposit_id):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT dr.*, u.username, u.first_name
+            FROM deposit_requests dr
+            JOIN users u ON dr.user_id = u.user_id
+            WHERE dr.id = ?
+        ''', (deposit_id,))
+        return cursor.fetchone()
+
+    def update_deposit_status(self, deposit_id, status):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'UPDATE deposit_requests SET status = ? WHERE id = ?',
+            (status, deposit_id)
+        )
+        self.conn.commit()
+
+    def add_support_request(self, user_id, message):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'INSERT INTO support_requests (user_id, message) VALUES (?, ?)',
+            (user_id, message)
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_pending_support_requests(self):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT sr.*, u.username, u.first_name
+            FROM support_requests sr
+            JOIN users u ON sr.user_id = u.user_id
+            WHERE sr.status = 'pending'
+        ''')
+        return cursor.fetchall()
+
+    def get_support_request_by_id(self, request_id):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT sr.*, u.username, u.first_name
+            FROM support_requests sr
+            JOIN users u ON sr.user_id = u.user_id
+            WHERE sr.id = ?
+        ''', (request_id,))
+        return cursor.fetchone()
+
+    def update_support_request_status(self, request_id, status):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'UPDATE support_requests SET status = ? WHERE id = ?',
+            (status, request_id)
+        )
+        self.conn.commit()
+
+    def add_reward_request(self, user_id, reward_type, proof_text, amount):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'INSERT INTO reward_requests (user_id, reward_type, proof_text, amount) VALUES (?, ?, ?, ?)',
+            (user_id, reward_type, proof_text, amount)
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_pending_reward_requests(self):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT rr.*, u.username, u.first_name
+            FROM reward_requests rr
+            JOIN users u ON rr.user_id = u.user_id
+            WHERE rr.status = 'pending'
+        ''')
+        return cursor.fetchall()
+
+    def get_reward_request_by_id(self, request_id):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT rr.*, u.username, u.first_name
+            FROM reward_requests rr
+            JOIN users u ON rr.user_id = u.user_id
+            WHERE rr.id = ?
+        ''', (request_id,))
+        return cursor.fetchone()
+
+    def update_reward_request_status(self, request_id, status):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'UPDATE reward_requests SET status = ? WHERE id = ?',
+            (status, request_id)
+        )
+        self.conn.commit()
+
+    def get_all_users(self):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT user_id FROM users')
+        return [row[0] for row in cursor.fetchall()]
+
+    def get_users_count(self):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM users')
+        return cursor.fetchone()[0]
+
+    def get_active_investors_count(self):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT COUNT(DISTINCT user_id) FROM investments WHERE is_active = 1')
+        return cursor.fetchone()[0]
+
+    def get_new_users_last_24h(self):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT COUNT(*) FROM users
+            WHERE datetime(registered_at) > datetime('now', '-1 day')
+        ''')
+        return cursor.fetchone()[0]
+
+    def get_total_invested(self):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT SUM(total_invested) FROM users')
+        result = cursor.fetchone()[0]
+        return result if result else 0.0
+
+    def get_total_earned(self):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT SUM(total_earned) FROM users')
+        result = cursor.fetchone()[0]
+        return result if result else 0.0
+
+    def get_online_users_count(self):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT COUNT(DISTINCT user_id) FROM operations
+            WHERE datetime(created_at) > datetime('now', '-10 minutes')
+        ''')
+        return cursor.fetchone()[0]
+
+    def update_notifications(self, user_id, enabled):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'UPDATE users SET notifications_enabled = ? WHERE user_id = ?',
+            (1 if enabled else 0, user_id)
+        )
+        self.conn.commit()
+
+    def update_subscription_status(self, user_id, has_subscribed):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'UPDATE users SET has_subscribed = ? WHERE user_id = ?',
+            (1 if has_subscribed else 0, user_id)
+        )
+        self.conn.commit()
+
+db = Database()
+
+# Функции для работы с настройками
+def load_settings():
+    global BOT_TOKEN, ADMIN_ID, SUPPORT_USERNAME, REQUIRED_CHANNEL, MIN_DEPOSIT, MIN_WITHDRAWAL, MIN_COLLECT
+    global REFERRAL_PERCENT_INVEST, REFERRAL_PERCENT_WITHDRAW, PROFIT_PERCENT, BOT_USERNAME, PAYMENT_DETAILS, REWARD_PRICES
+
+    settings = db.get_all_settings()
+
+    if settings:
+        BOT_TOKEN = settings.get('bot_token', BOT_TOKEN)
+        ADMIN_ID = int(settings.get('admin_id', ADMIN_ID))
+        SUPPORT_USERNAME = settings.get('support_username', SUPPORT_USERNAME)
+
+        REQUIRED_CHANNEL["id"] = settings.get('channel_id', REQUIRED_CHANNEL["id"])
+        REQUIRED_CHANNEL["username"] = settings.get('channel_username', REQUIRED_CHANNEL["username"])
+        REQUIRED_CHANNEL["name"] = settings.get('channel_name', REQUIRED_CHANNEL["name"])
+
+        MIN_DEPOSIT = float(settings.get('min_deposit', MIN_DEPOSIT))
+        MIN_WITHDRAWAL = float(settings.get('min_withdrawal', MIN_WITHDRAWAL))
+        MIN_COLLECT = float(settings.get('min_collect', MIN_COLLECT))
+        REFERRAL_PERCENT_INVEST = float(settings.get('referral_invest', REFERRAL_PERCENT_INVEST))
+        REFERRAL_PERCENT_WITHDRAW = float(settings.get('referral_withdraw', REFERRAL_PERCENT_WITHDRAW))
+        PROFIT_PERCENT = float(settings.get('profit_percent', PROFIT_PERCENT))
+        BOT_USERNAME = settings.get('bot_username', BOT_USERNAME)
+
+        payment_json = settings.get('payment_details')
+        if payment_json:
+            PAYMENT_DETAILS = json.loads(payment_json)
+
+        rewards_json = settings.get('reward_prices')
+        if rewards_json:
+            REWARD_PRICES = json.loads(rewards_json)
+
+load_settings()
+
+# Функция для проверки подписки
+async def check_subscription(user_id):
+    try:
+        member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL["id"], user_id=user_id)
+        return member.status in ['member', 'administrator', 'creator']
+    except Exception as e:
+        print(f"Error checking subscription: {e}")
+        return False
+
+# Функция для показа подписки
+def get_subscription_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text=f"📢 {REQUIRED_CHANNEL['name']}", url=f"https://t.me/{REQUIRED_CHANNEL['username'][1:]}")
+    builder.button(text="✅ Я подписался", callback_data="check_subscription")
+    builder.adjust(1)
+    return builder.as_markup()
+
+# Функция для расчета накопленной прибыли
+def calculate_accumulated_profit(investment):
+    if not investment:
+        return 0.0
+
+    try:
+        invested_amount = investment[2]
+        last_updated = investment[5]
+        already_accumulated = investment[3]
+
+        if isinstance(last_updated, str):
+            last_updated = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
+
+        now = datetime.now()
+        time_passed = now - last_updated
+        hours_passed = time_passed.total_seconds() / 3600
+
+        hourly_profit_percent = PROFIT_PERCENT / 24 / 100
+        new_profit = invested_amount * hourly_profit_percent * hours_passed
+
+        total_accumulated = already_accumulated + new_profit
+        max_daily_profit = invested_amount * (PROFIT_PERCENT / 100)
+
+        return min(total_accumulated, max_daily_profit)
+
+    except Exception as e:
+        print(f"Error calculating profit: {e}")
+        return 0.0
+
+# Функция для расчета прогресса накопления
+def get_accumulation_progress(investment):
+    if not investment:
+        return "0%"
+
+    try:
+        invested_amount = investment[2]
+        accumulated = calculate_accumulated_profit(investment)
+        max_daily_profit = invested_amount * (PROFIT_PERCENT / 100)
+
+        if max_daily_profit == 0:
+            return "0%"
+
+        progress = (accumulated / max_daily_profit) * 100
+        return f"{progress:.1f}%"
+
+    except Exception as e:
+        print(f"Error calculating progress: {e}")
+        return "0%"
+
+# Функция для обновления сообщения с прогрессом
+async def update_investment_progress(user_id, message_id):
+    try:
+        while user_id in active_timers and active_timers[user_id]:
+            investment = db.get_active_investment(user_id)
+
+            if not investment:
+                break
+
+            invested_amount = investment[2] if investment else 0.0
+            accumulated_profit = calculate_accumulated_profit(investment)
+            progress = get_accumulation_progress(investment)
+
+            db.update_investment_accumulated(investment[0], accumulated_profit)
+
+            text = f"""
+<b>▪️ Открывай инвестиции и получай стабильную прибыль в данном разделе, после собирай доход:</b>
+
+💰 <b>Процент прибыли:</b> {PROFIT_PERCENT}% в сутки
+⏱ <b>Время накопления:</b> 24 часа
+📆 <b>Срок вклада:</b> Пожизненно
+
+💳 <b>Ваш вклад:</b> {invested_amount:.1f}₽
+💵 <b>Накопление:</b> {accumulated_profit:.2f}₽
+
+📊 <b>Прогресс:</b> {progress}
+💡 <b>Можно собрать от {MIN_COLLECT}₽</b>
+    """
+
+            try:
+                await bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=message_id,
+                    text=text,
+                    reply_markup=get_investment_keyboard(),
+                    parse_mode="HTML"
+                )
+            except Exception:
+                break
+
+            await asyncio.sleep(1)
+
+    except Exception as e:
+        print(f"Ошибка в таймере: {e}")
+
+# Функция для расчета дней работы бота
+def get_days_working():
+    cursor = db.conn.cursor()
+    cursor.execute('SELECT MIN(registered_at) FROM users')
+    result = cursor.fetchone()[0]
+    if result:
+        if isinstance(result, str):
+            start_date = datetime.fromisoformat(result.replace('Z', '+00:00'))
+        else:
+            start_date = result
+        now = datetime.now()
+        days_working = (now - start_date).days
+        return max(days_working, 1)
+    return 1
+
+# Клавиатуры
+def get_main_keyboard():
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🖥 Инвестиции"), KeyboardButton(text="👔 Партнёрам")],
+            [KeyboardButton(text="💳 Кошелёк"), KeyboardButton(text="📠 Калькулятор")],
+            [KeyboardButton(text="🆘 Помощь в продвижении"), KeyboardButton(text="📔 Обучение")],
+            [KeyboardButton(text="⚙️ Настройки")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
+
+def get_investment_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💳 Инвестировать", callback_data="invest")
+    builder.button(text="💰 Собрать накопления", callback_data="collect")
+    builder.button(text="◀️ Назад", callback_data="back_to_main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_partners_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📖 Инструкция", url="https://t.me/your_channel")
+    builder.button(text="◀️ Назад", callback_data="back_to_main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_wallet_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📥 Пополнить", callback_data="deposit")
+    builder.button(text="📤 Вывести", callback_data="withdraw")
+    builder.button(text="🔄 Реинвестировать", callback_data="reinvest")
+    builder.button(text="◀️ Назад", callback_data="back_to_main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_deposit_methods_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💳 СБП", callback_data="deposit_sbp")
+    builder.button(text="💳 Карта", callback_data="deposit_card")
+    builder.button(text="🅿️ Payeer", callback_data="deposit_payeer")
+    builder.button(text="👨‍💼 Ручное пополнение", callback_data="deposit_manual")
+    builder.button(text="◀️ Назад", callback_data="back_to_wallet")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_withdraw_methods_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💳 На карту", callback_data="withdraw_card")
+    builder.button(text="🅿️ Payeer", callback_data="withdraw_payeer")
+    builder.button(text="◀️ Назад", callback_data="back_to_wallet")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_settings_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📊 Статистика", callback_data="statistics")
+    builder.button(text="👨‍💼 Администратор", url=f"https://t.me/{SUPPORT_USERNAME[1:]}")
+    builder.button(text="🔔 Уведомления", callback_data="notifications")
+    builder.button(text="📋 Операции", callback_data="operations")
+    builder.button(text="🆘 Связь с поддержкой", callback_data="support")
+    builder.button(text="◀️ Назад", callback_data="back_to_main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_promotion_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📝 Пост в соцсетях", callback_data="reward_post")
+    builder.button(text="🎥 Видео-обзор", callback_data="reward_video")
+    builder.button(text="✨ Сторис", callback_data="reward_story")
+    builder.button(text="⭐ Отзыв", callback_data="reward_review")
+    builder.button(text="🆘 Связь с поддержкой", callback_data="support")
+    builder.button(text="◀️ Назад", callback_data="back_to_main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_admin_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📢 Рассылка", callback_data="admin_broadcast")
+    builder.button(text="💳 Пополнить баланс", callback_data="admin_deposit")
+    builder.button(text="📋 Заявки на вывод", callback_data="admin_withdrawals")
+    builder.button(text="📥 Заявки на пополнение", callback_data="admin_deposit_requests")
+    builder.button(text="🆘 Заявки поддержки", callback_data="admin_support_requests")
+    builder.button(text="🎁 Заявки на награды", callback_data="admin_reward_requests")
+    builder.button(text="👤 Управление пользователями", callback_data="admin_user_management")
+    builder.button(text="📊 Статистика", callback_data="admin_stats")
+    builder.button(text="⚙️ Управление ботом", callback_data="admin_management")
+    builder.button(text="◀️ Выход", callback_data="back_to_main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_user_management_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❄️ Заморозить баланс", callback_data="admin_freeze_user")
+    builder.button(text="🔥 Разморозить баланс", callback_data="admin_unfreeze_user")
+    builder.button(text="🚫 Заблокировать пользователя", callback_data="admin_block_user")
+    builder.button(text="✅ Разблокировать пользователя", callback_data="admin_unblock_user")
+    builder.button(text="◀️ Назад", callback_data="admin_panel")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_management_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🤖 Токен бота", callback_data="manage_bot_token")
+    builder.button(text="👑 ID администратора", callback_data="manage_admin_id")
+    builder.button(text="💵 Мин. пополнение", callback_data="manage_min_deposit")
+    builder.button(text="💸 Мин. вывод", callback_data="manage_min_withdrawal")
+    builder.button(text="💰 Мин. сбор", callback_data="manage_min_collect")
+    builder.button(text="📈 % прибыли", callback_data="manage_profit_percent")
+    builder.button(text="👥 % рефералов (инвест)", callback_data="manage_referral_invest")
+    builder.button(text="👥 % рефералов (вывод)", callback_data="manage_referral_withdraw")
+    builder.button(text="🔗 Имя бота", callback_data="manage_bot_username")
+    builder.button(text="👨‍💼 Поддержка", callback_data="manage_support_username")
+    builder.button(text="📢 ID канала", callback_data="manage_channel_id")
+    builder.button(text="📢 Юзернейм канала", callback_data="manage_channel_username")
+    builder.button(text="📢 Название канала", callback_data="manage_channel_name")
+    builder.button(text="💳 Реквизиты оплаты", callback_data="manage_payment_details")
+    builder.button(text="🎁 Награды за активности", callback_data="manage_rewards")
+    builder.button(text="🔄 Перезагрузить бота", callback_data="admin_restart_bot")
+    builder.button(text="◀️ Назад", callback_data="admin_panel")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_payment_management_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💳 СБП", callback_data="manage_payment_sbp")
+    builder.button(text="💳 Карта", callback_data="manage_payment_card")
+    builder.button(text="🅿️ Payeer", callback_data="manage_payment_payeer")
+    builder.button(text="◀️ Назад", callback_data="admin_management")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_rewards_management_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📝 Пост в соцсетях", callback_data="manage_reward_post")
+    builder.button(text="🎥 Видео-обзор", callback_data="manage_reward_video")
+    builder.button(text="✨ Сторис", callback_data="manage_reward_story")
+    builder.button(text="⭐ Отзыв", callback_data="manage_reward_review")
+    builder.button(text="◀️ Назад", callback_data="admin_management")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_back_to_settings_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="◀️ Назад", callback_data="back_to_settings")
+    return builder.as_markup()
+
+def get_back_to_admin_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="◀️ Назад", callback_data="admin_panel")
+    return builder.as_markup()
+
+def get_back_to_management_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="◀️ Назад", callback_data="admin_management")
+    return builder.as_markup()
+
+def get_payment_confirmation_keyboard(deposit_id):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Я оплатил", callback_data=f"confirm_payment_{deposit_id}")
+    builder.button(text="❌ Отменить", callback_data="back_to_wallet")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_calc_keyboard(amount):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💳 Инвестировать эту сумму", callback_data=f"invest_calc_{amount}")
+    builder.button(text="🔄 Рассчитать еще", callback_data="calc_again")
+    builder.button(text="◀️ Назад", callback_data="back_to_main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_withdrawal_actions_keyboard(withdrawal_id):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Одобрить", callback_data=f"approve_withdrawal_{withdrawal_id}")
+    builder.button(text="❌ Отклонить", callback_data=f"reject_withdrawal_{withdrawal_id}")
+    builder.adjust(2)
+    return builder.as_markup()
+
+def get_deposit_actions_keyboard(deposit_id):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить", callback_data=f"approve_deposit_{deposit_id}")
+    builder.button(text="❌ Отклонить", callback_data=f"reject_deposit_{deposit_id}")
+    builder.adjust(2)
+    return builder.as_markup()
+
+def get_support_actions_keyboard(request_id):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Обработано", callback_data=f"approve_support_{request_id}")
+    builder.button(text="❌ Отклонить", callback_data=f"reject_support_{request_id}")
+    builder.adjust(2)
+    return builder.as_markup()
+
+def get_reward_actions_keyboard(request_id):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Выплатить", callback_data=f"approve_reward_{request_id}")
+    builder.button(text="❌ Отклонить", callback_data=f"reject_reward_{request_id}")
+    builder.adjust(2)
+    return builder.as_markup()
+
+# Анимации
+async def show_loading_animation(message, text, duration=2.0):
+    """
+    Показывает анимацию загрузки
+    """
+    try:
+        loading_msg = await message.answer(text + " ⏳")
+        await asyncio.sleep(duration)
+        await loading_msg.delete()
+    except Exception as e:
+        print(f"Error in show_loading_animation: {e}")
+
+# Фильтры для проверки пользователя
+async def check_user_access(event):
+    """Проверяет доступ пользователя (блокировка и подписка)"""
+    user_id = event.from_user.id
+    user = db.get_user(user_id)
+    
+    # Проверка блокировки
+    if user and user[12]:  # is_blocked
+        if isinstance(event, types.Message):
+            await event.answer("🚫 Ваш аккаунт заблокирован. Для разблокировки обратитесь в поддержку.")
+        else:
+            await event.answer("🚫 Ваш аккаунт заблокирован. Для разблокировки обратитесь в поддержку.", show_alert=True)
+        return False
+    
+    # Проверка подписки
+    if user and not user[10]:  # has_subscribed
+        is_subscribed = await check_subscription(user_id)
+        if is_subscribed:
+            db.update_subscription_status(user_id, True)
+        else:
+            text = f"""
+<b>📢 ОБЯЗАТЕЛЬНАЯ ПОДПИСКА</b>
+
+Для использования бота необходимо подписаться на наш канал:
+
+<b>{REQUIRED_CHANNEL['name']}</b>
+
+👇 <b>Подпишитесь на канал ниже и нажмите кнопку "Я подписался"</b>
+            """
+            if isinstance(event, types.Message):
+                await event.answer(text, reply_markup=get_subscription_keyboard(), parse_mode="HTML")
+            else:
+                await event.message.answer(text, reply_markup=get_subscription_keyboard(), parse_mode="HTML")
+            return False
+    
+    return True
+
+# Обработчики команд
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name
+
+    referral_id = None
+    if len(message.text.split()) > 1:
+        try:
+            referral_id = int(message.text.split()[1])
+        except ValueError:
+            pass
+
+    db.add_user(user_id, username, first_name, referral_id)
+
+    is_subscribed = await check_subscription(user_id)
+    if is_subscribed:
+        db.update_subscription_status(user_id, True)
+
+        welcome_text = f"""
+<b>🤖 Добро пожаловать, {first_name}!</b>
+
+💼 <b>Это автоматическая инвестиционная система с ежедневным доходом.</b>
+
+📈 <b>Начните инвестировать и получайте стабильную прибыль!</b>
+
+👇 <b>Выберите раздел в меню:</b>
+        """
+
+        await message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="HTML")
+    else:
+        text = f"""
+<b>📢 ОБЯЗАТЕЛЬНАЯ ПОДПИСКА</b>
+
+Для использования бота необходимо подписаться на наш канал:
+
+<b>{REQUIRED_CHANNEL['name']}</b>
+
+👇 <b>Подпишитесь на канал ниже и нажмите кнопку "Я подписался"</b>
+        """
+        await message.answer(text, reply_markup=get_subscription_keyboard(), parse_mode="HTML")
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Доступ запрещен")
+        return
+
+    text = "<b>👨‍💼 Панель администратора</b>\n\nВыберите действие:"
+    await message.answer(text, reply_markup=get_admin_keyboard(), parse_mode="HTML")
+
+# Обработчик проверки подписки
+@dp.callback_query(lambda c: c.data == "check_subscription")
+async def check_subscription_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    is_subscribed = await check_subscription(user_id)
+
+    if is_subscribed:
+        db.update_subscription_status(user_id, True)
+        await callback.message.delete()
+
+        welcome_text = f"""
+<b>🤖 Добро пожаловать, {callback.from_user.first_name}!</b>
+
+💼 <b>Это автоматическая инвестиционная система с ежедневным доходом.</b>
+
+📈 <b>Начните инвестировать и получайте стабильную прибыль!</b>
+
+👇 <b>Выберите раздел в меню:</b>
+        """
+
+        await callback.message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="HTML")
+    else:
+        await callback.answer("❌ Вы не подписались на канал! Подпишитесь и нажмите снова.", show_alert=True)
+
+# Основные обработчики меню
+@dp.message(lambda message: message.text == "🖥 Инвестиции")
+async def investments_menu(message: types.Message):
+    if not await check_user_access(message):
+        return
+        
+    user_id = message.from_user.id
+
+    if user_id in active_timers:
+        active_timers[user_id] = False
+        await asyncio.sleep(0.5)
+
+    investment = db.get_active_investment(user_id)
+
+    invested_amount = investment[2] if investment else 0.0
+    accumulated_profit = calculate_accumulated_profit(investment) if investment else 0.0
+    progress = get_accumulation_progress(investment) if investment else "0%"
+
+    text = f"""
+<b>▪️ Открывай инвестиции и получай стабильную прибыль в данном разделе, после собирай доход:</b>
+
+💰 <b>Процент прибыли:</b> {PROFIT_PERCENT}% в сутки
+⏱ <b>Время накопления:</b> 24 часа
+📆 <b>Срок вклада:</b> Пожизненно
+
+💳 <b>Ваш вклад:</b> {invested_amount:.1f}₽
+💵 <b>Накопление:</b> {accumulated_profit:.2f}₽
+
+📊 <b>Прогресс:</b> {progress}
+💡 <b>Можно собрать от {MIN_COLLECT}₽</b>
+    """
+
+    msg = await message.answer(text, reply_markup=get_investment_keyboard(), parse_mode="HTML")
+
+    active_timers[user_id] = True
+    asyncio.create_task(update_investment_progress(user_id, msg.message_id))
+
+@dp.message(lambda message: message.text == "👔 Партнёрам")
+async def partners_menu(message: types.Message):
+    if not await check_user_access(message):
+        return
+        
+    user_id = message.from_user.id
+    user = db.get_user(user_id)
+
+    ref_balance = user[4] if user else 0.0
+    referrals_count = user[8] if user else 0
+    ref_link = f"https://t.me/{BOT_USERNAME[1:]}?start={user_id}"
+
+    text = f"""
+<b>👔 Партнерская программа</b>
+
+💸 <b>Реферальный баланс:</b> {ref_balance:.2f}₽
+👥 <b>Приглашено партнеров:</b> {referrals_count}
+
+🔗 <b>Ваша реферальная ссылка:</b>
+<code>{ref_link}</code>
+
+💰 <b>Бонус за приглашение:</b>
+• {REFERRAL_PERCENT_INVEST}% от депозита реферала
+• {REFERRAL_PERCENT_WITHDRAW}% от вывода реферала
+
+📖 <b>Инструкция:</b> Как привлекать партнеров?
+    """
+
+    await show_loading_animation(message, "👔 Загружаем партнерскую программу...")
+    await message.answer(text, reply_markup=get_partners_keyboard(), parse_mode="HTML")
+
+@dp.message(lambda message: message.text == "💳 Кошелёк")
+async def wallet_menu(message: types.Message):
+    if not await check_user_access(message):
+        return
+        
+    user_id = message.from_user.id
+    user = db.get_user(user_id)
+
+    balance = user[3] if user else 0.0
+    ref_balance = user[4] if user else 0.0
+    referrals_count = user[8] if user else 0
+
+    text = f"""
+<b>🆔 Ваш ID:</b> {user_id}
+
+💰 <b>Ваш баланс:</b> {balance:.2f}₽
+
+💳 <b>Партнерский баланс:</b> {ref_balance:.2f}₽
+👥 <b>Партнеров:</b> {referrals_count} чел.
+    """
+
+    await show_loading_animation(message, "💳 Открываем кошелек...")
+    await message.answer(text, reply_markup=get_wallet_keyboard(), parse_mode="HTML")
+
+@dp.message(lambda message: message.text == "📠 Калькулятор")
+async def calculator_menu(message: types.Message, state: FSMContext):
+    if not await check_user_access(message):
+        return
+        
+    text = f"""
+<b>📊 Калькулятор доходности</b>
+
+Введите сумму инвестиции для расчета потенциального дохода:
+
+💵 <b>Минимальная сумма:</b> 10₽
+📈 <b>Ежедневная прибыль:</b> {PROFIT_PERCENT}%
+⏱ <b>Расчет:</b> за 24 часа
+    """
+
+    await show_loading_animation(message, "📊 Открываем калькулятор...")
+    await message.answer(text, parse_mode="HTML")
+    await state.set_state(UserStates.waiting_calc_amount)
+
+@dp.message(UserStates.waiting_calc_amount)
+async def process_calc_amount(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text)
+        if amount < 10:
+            await message.answer("❌ Минимальная сумма для расчета: 10₽")
+            return
+
+        daily_profit = amount * PROFIT_PERCENT / 100
+        weekly_profit = daily_profit * 7
+        monthly_profit = daily_profit * 30
+
+        text = f"""
+<b>📊 Результаты расчета</b>
+
+💵 <b>Сумма инвестиции:</b> {amount:.2f}₽
+📈 <b>Ежедневная прибыль:</b> {PROFIT_PERCENT}%
+
+💰 <b>Доходность:</b>
+• За 24 часа: {daily_profit:.2f}₽
+• За неделю: {weekly_profit:.2f}₽
+• За месяц: {monthly_profit:.2f}₽
+
+💡 <b>Совет:</b> Реинвестируйте прибыль для увеличения дохода!
+        """
+
+        await message.answer(text, reply_markup=get_calc_keyboard(amount), parse_mode="HTML")
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректную сумму")
+
+@dp.callback_query(lambda c: c.data == "calc_again")
+async def calc_again_callback(callback: types.CallbackQuery, state: FSMContext):
+    if not await check_user_access(callback):
+        return
+        
+    text = f"""
+<b>📊 Калькулятор доходности</b>
+
+Введите сумму инвестиции для расчета потенциального дохода:
+
+💵 <b>Минимальная сумма:</b> 10₽
+📈 <b>Ежедневная прибыль:</b> {PROFIT_PERCENT}%
+⏱ <b>Расчет:</b> за 24 часа
+    """
+
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await state.set_state(UserStates.waiting_calc_amount)
+
+@dp.callback_query(lambda c: c.data.startswith("invest_calc_"))
+async def invest_from_calc_callback(callback: types.CallbackQuery, state: FSMContext):
+    if not await check_user_access(callback):
+        return
+        
+    amount = float(callback.data.replace("invest_calc_", ""))
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+    balance = user[3] if user else 0.0
+
+    if amount > balance:
+        await callback.answer("❌ Недостаточно средств на балансе", show_alert=True)
+        return
+
+    if amount < MIN_DEPOSIT:
+        await callback.answer(f"❌ Минимальная сумма инвестиции: {MIN_DEPOSIT}₽", show_alert=True)
+        return
+
+    db.add_investment(user_id, amount)
+    db.update_balance(user_id, -amount)
+    db.add_operation(user_id, "investment", amount)
+
+    await callback.answer(f"✅ Успешно инвестировано {amount:.2f}₽", show_alert=True)
+
+    investment = db.get_active_investment(user_id)
+    invested_amount = investment[2] if investment else 0.0
+    accumulated_profit = calculate_accumulated_profit(investment) if investment else 0.0
+    progress = get_accumulation_progress(investment) if investment else "0%"
+
+    text = f"""
+<b>▪️ Открывай инвестиции и получай стабильную прибыль в данном разделе, после собирай доход:</b>
+
+💰 <b>Процент прибыли:</b> {PROFIT_PERCENT}% в сутки
+⏱ <b>Время накопления:</b> 24 часа
+📆 <b>Срок вклада:</b> Пожизненно
+
+💳 <b>Ваш вклад:</b> {invested_amount:.1f}₽
+💵 <b>Накопление:</b> {accumulated_profit:.2f}₽
+
+📊 <b>Прогресс:</b> {progress}
+💡 <b>Можно собрать от {MIN_COLLECT}₽</b>
+    """
+
+    await callback.message.edit_text(text, reply_markup=get_investment_keyboard(), parse_mode="HTML")
+
+@dp.message(lambda message: message.text == "📔 Обучение")
+async def education_menu(message: types.Message):
+    if not await check_user_access(message):
+        return
+        
+    text = """
+<b>📔 Обучение инвестициям</b>
+
+🎯 <b>Основные принципы:</b>
+• Инвестируйте только свободные средства
+• Диверсифицируйте вложения
+• Реинвестируйте прибыль для роста
+
+💡 <b>Стратегии:</b>
+• Начинайте с небольших сумм
+• Постепенно увеличивайте инвестиции
+• Используйте партнерскую программу
+
+📚 <b>Материалы:</b>
+• Базовая информация в нашем канале
+• Примеры успешных стратегий
+• Советы от опытных инвесторов
+    """
+
+    await show_loading_animation(message, "📔 Загружаем обучение...")
+    await message.answer(text, parse_mode="HTML")
+
+@dp.message(lambda message: message.text == "🆘 Помощь в продвижении")
+async def promotion_help_menu(message: types.Message):
+    if not await check_user_access(message):
+        return
+        
+    text = f"""
+<b>🆘 Помощь в продвижении бота</b>
+
+💰 <b>Получайте вознаграждение за активность!</b>
+
+🎯 <b>Доступные задания:</b>
+• 📝 Пост в соцсетях - {REWARD_PRICES['post']}₽
+• 🎥 Видео-обзор - {REWARD_PRICES['video']}₽
+• ✨ Сторис - {REWARD_PRICES['story']}₽
+• ⭐ Отзыв - {REWARD_PRICES['review']}₽
+
+📋 <b>Как получить награду:</b>
+1. Выберите тип задания
+2. Сделайте пост/видео/сторис/отзыв
+3. Отправьте ссылку или описание
+4. Получите одобрение администратора
+5. Вознаграждение поступит на ваш баланс
+
+👇 <b>Выберите тип задания:</b>
+    """
+
+    await show_loading_animation(message, "🆘 Загружаем задания...")
+    await message.answer(text, reply_markup=get_promotion_keyboard(), parse_mode="HTML")
+
+@dp.message(lambda message: message.text == "⚙️ Настройки")
+async def settings_menu(message: types.Message):
+    if not await check_user_access(message):
+        return
+        
+    days_working = get_days_working()
+    total_investors = db.get_active_investors_count()
+    new_investors_24h = db.get_new_users_last_24h()
+    online_now = db.get_online_users_count()
+
+    text = f"""
+<b>▪️ Вы попали в раздел настройки бота, здесь вы можете посмотреть статистику, а также узнать информацию или отключить уведомления.</b>
+
+🌐 <b>Дней работаем:</b> {days_working}
+▪️ <b>Всего инвесторов:</b> {total_investors}
+▪️ <b>Новых за 24 часа:</b> {new_investors_24h}
+▪️ <b>Онлайн:</b> {online_now}
+    """
+
+    await show_loading_animation(message, "⚙️ Открываем настройки...")
+    await message.answer(text, reply_markup=get_settings_keyboard(), parse_mode="HTML")
+
+# Обработчики инвестиций
+@dp.callback_query(lambda c: c.data == "invest")
+async def invest_callback(callback: types.CallbackQuery, state: FSMContext):
+    if not await check_user_access(callback):
+        return
+        
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+    balance = user[3] if user else 0.0
+
+    text = f"""
+<b>💳 Инвестирование</b>
+
+💰 <b>Ваш баланс:</b> {balance:.2f}₽
+💵 <b>Минимальная сумма:</b> {MIN_DEPOSIT}₽
+
+Введите сумму для инвестирования:
+    """
+
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await state.set_state(UserStates.waiting_invest_amount)
+
+@dp.message(UserStates.waiting_invest_amount)
+async def process_invest_amount(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    user = db.get_user(user_id)
+    balance = user[3] if user else 0.0
+
+    try:
+        amount = float(message.text)
+        if amount < MIN_DEPOSIT:
+            await message.answer(f"❌ Минимальная сумма инвестиции: {MIN_DEPOSIT}₽")
+            return
+        if amount > balance:
+            await message.answer("❌ Недостаточно средств на балансе")
+            return
+
+        db.add_investment(user_id, amount)
+        db.update_balance(user_id, -amount)
+        db.add_operation(user_id, "investment", amount)
+
+        await message.answer(f"✅ Успешно инвестировано {amount:.2f}₽")
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректную сумму")
+
+# Обработчик кнопки "Собрать накопления"
+@dp.callback_query(lambda c: c.data == "collect")
+async def collect_callback(callback: types.CallbackQuery):
+    if not await check_user_access(callback):
+        return
+        
+    user_id = callback.from_user.id
+    investment = db.get_active_investment(user_id)
+
+    if not investment:
+        await callback.answer("❌ У вас нет активных инвестиций", show_alert=True)
+        return
+
+    accumulated_profit = calculate_accumulated_profit(investment)
+
+    if accumulated_profit < MIN_COLLECT:
+        await callback.answer(f"❌ Минимальная сумма для сбора: {MIN_COLLECT}₽. Накоплено: {accumulated_profit:.2f}₽", show_alert=True)
+        return
+
+    db.update_balance(user_id, accumulated_profit)
+    db.add_operation(user_id, "profit_collection", accumulated_profit)
+    db.reset_investment_accumulated(investment[0])
+
+    cursor = db.conn.cursor()
+    cursor.execute(
+        'UPDATE users SET total_earned = total_earned + ? WHERE user_id = ?',
+        (accumulated_profit, user_id)
+    )
+    db.conn.commit()
+
+    await callback.answer(f"✅ Собрано {accumulated_profit:.2f}₽ прибыли!", show_alert=True)
+
+    investment = db.get_active_investment(user_id)
+    invested_amount = investment[2] if investment else 0.0
+    new_accumulated = 0.0
+    progress = "0%"
+
+    text = f"""
+<b>▪️ Открывай инвестиции и получай стабильную прибыль в данном разделе, после собирай доход:</b>
+
+💰 <b>Процент прибыли:</b> {PROFIT_PERCENT}% в сутки
+⏱ <b>Время накопления:</b> 24 часа
+📆 <b>Срок вклада:</b> Пожизненно
+
+💳 <b>Ваш вклад:</b> {invested_amount:.1f}₽
+💵 <b>Накопление:</b> {new_accumulated:.2f}₽
+
+📊 <b>Прогресс:</b> {progress}
+💡 <b>Можно собрать от {MIN_COLLECT}₽</b>
+    """
+
+    await callback.message.edit_text(text, reply_markup=get_investment_keyboard(), parse_mode="HTML")
+
+# Обработчики кошелька
+@dp.callback_query(lambda c: c.data == "deposit")
+async def deposit_callback(callback: types.CallbackQuery):
+    if not await check_user_access(callback):
+        return
+        
+    text = """
+<b>📥 Пополнение баланса</b>
+
+Выберите способ пополнения:
+
+💳 <b>СБП</b> - мгновенное зачисление
+💳 <b>Карта</b> - перевод на карту
+🅿️ <b>Payeer</b> - международные платежи
+👨‍💼 <b>Ручное пополнение</b> - через администратора
+    """
+
+    await callback.message.edit_text(text, reply_markup=get_deposit_methods_keyboard(), parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data == "withdraw")
+async def withdraw_callback(callback: types.CallbackQuery):
+    if not await check_user_access(callback):
+        return
+        
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+    balance = user[3] if user else 0.0
+
+    text = f"""
+<b>📤 Вывод средств</b>
+
+💰 <b>Доступно для вывода:</b> {balance:.2f}₽
+💵 <b>Минимальная сумма:</b> {MIN_WITHDRAWAL}₽
+
+Выберите способ вывода:
+    """
+
+    await callback.message.edit_text(text, reply_markup=get_withdraw_methods_keyboard(), parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data == "reinvest")
+async def reinvest_callback(callback: types.CallbackQuery):
+    if not await check_user_access(callback):
+        return
+        
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+    balance = user[3] if user else 0.0
+
+    if balance < MIN_DEPOSIT:
+        await callback.answer(f"❌ Минимальная сумма для реинвестирования: {MIN_DEPOSIT}₽", show_alert=True)
+        return
+
+    db.add_investment(user_id, balance)
+    db.update_balance(user_id, -balance)
+    db.add_operation(user_id, "reinvestment", balance)
+
+    await callback.answer(f"✅ Успешно реинвестировано {balance:.2f}₽", show_alert=True)
+
+# Обработчики пополнения
+@dp.callback_query(lambda c: c.data.startswith("deposit_"))
+async def deposit_method_callback(callback: types.CallbackQuery, state: FSMContext):
+    if not await check_user_access(callback):
+        return
+        
+    method = callback.data.replace("deposit_", "")
+    await state.update_data(deposit_method=method)
+
+    if method == "manual":
+        text = f"""
+<b>👨‍💼 Ручное пополнение</b>
+
+Для пополнения баланса свяжитесь с администратором:
+{SUPPORT_USERNAME}
+
+Укажите:
+1. Сумму пополнения
+2. Ваш ID: <code>{callback.from_user.id}</code>
+3. Скриншот оплаты
+        """
+        await callback.message.edit_text(text, parse_mode="HTML")
+    else:
+        text = f"""
+<b>💳 Пополнение баланса</b>
+
+💳 <b>Способ:</b> {method.upper()}
+💵 <b>Минимальная сумма:</b> {MIN_DEPOSIT}₽
+
+Введите сумму для пополнения:
+        """
+        await callback.message.edit_text(text, parse_mode="HTML")
+        await state.set_state(UserStates.waiting_deposit_amount)
+
+@dp.message(UserStates.waiting_deposit_amount)
+async def process_deposit_amount(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text)
+        if amount < MIN_DEPOSIT:
+            await message.answer(f"❌ Минимальная сумма пополнения: {MIN_DEPOSIT}₽")
+            return
+
+        data = await state.get_data()
+        method = data.get('deposit_method')
+
+        if method in ["sbp", "card", "payeer"]:
+            details = ""
+            if method == "sbp":
+                details = f"""
+<b>💳 Реквизиты для оплаты по СБП:</b>
+
+🏦 <b>Банк:</b> {PAYMENT_DETAILS['sbp']['bank']}
+📱 <b>Телефон:</b> {PAYMENT_DETAILS['sbp']['phone']}
+👤 <b>Получатель:</b> {PAYMENT_DETAILS['sbp']['recipient']}
+
+💡 <b>В комментарии укажите:</b> ваш ID
+                """
+            elif method == "card":
+                details = f"""
+<b>💳 Реквизиты для оплаты на карту:</b>
+
+🏦 <b>Банк:</b> {PAYMENT_DETAILS['card']['bank']}
+💳 <b>Номер карты:</b> {PAYMENT_DETAILS['card']['card_number']}
+👤 <b>Получатель:</b> {PAYMENT_DETAILS['card']['recipient']}
+
+💡 <b>В комментарии укажите:</b> ваш ID
+                """
+            else:  # payeer
+                details = f"""
+<b>🅿️ Реквизиты для оплаты через Payeer:</b>
+
+👤 <b>Аккаунт:</b> {PAYMENT_DETAILS['payeer']['account']}
+💼 <b>Кошелек:</b> {PAYMENT_DETAILS['payeer']['wallet']}
+🔗 <b>Ссылка:</b> {PAYMENT_DETAILS['payeer']['link']}
+
+💡 <b>В комментарии укажите:</b> ваш ID
+                """
+
+            deposit_id = db.add_deposit_request(message.from_user.id, amount, method)
+
+            text = f"""
+{details}
+
+💵 <b>Сумма к оплате:</b> {amount}₽
+🆔 <b>Ваш ID для указания в комментарии:</b> <code>{message.from_user.id}</code>
+
+👇 <b>После оплаты нажмите кнопку "Я оплатил"</b>
+            """
+
+            await message.answer(text, reply_markup=get_payment_confirmation_keyboard(deposit_id), parse_mode="HTML")
+
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректную сумму")
+
+# Обработчик подтверждения оплаты
+@dp.callback_query(lambda c: c.data.startswith("confirm_payment_"))
+async def confirm_payment_callback(callback: types.CallbackQuery):
+    deposit_id = int(callback.data.replace("confirm_payment_", ""))
+    deposit = db.get_deposit_by_id(deposit_id)
+
+    if deposit:
+        admin_text = f"""
+<b>📥 Новая заявка на пополнение #{deposit_id}</b>
+
+👤 <b>Пользователь:</b> {callback.from_user.first_name} (@{callback.from_user.username})
+🆔 <b>ID:</b> {deposit[1]}
+💵 <b>Сумма:</b> {deposit[2]}₽
+💳 <b>Способ:</b> {deposit[3]}
+
+⏰ <b>Время:</b> {deposit[5]}
+        """
+
+        await bot.send_message(ADMIN_ID, admin_text, reply_markup=get_deposit_actions_keyboard(deposit_id), parse_mode="HTML")
+
+        await callback.message.edit_text(
+            "✅ <b>Заявка отправлена администратору</b>\n\nОжидайте подтверждения оплаты.",
+            parse_mode="HTML"
+        )
+        await callback.answer("✅ Заявка отправлена администратору", show_alert=True)
+    else:
+        await callback.answer("❌ Заявка не найдена", show_alert=True)
+
+# Обработчики вывода
+@dp.callback_query(lambda c: c.data.startswith("withdraw_"))
+async def withdraw_method_callback(callback: types.CallbackQuery, state: FSMContext):
+    if not await check_user_access(callback):
+        return
+        
+    method = callback.data.replace("withdraw_", "")
+    await state.update_data(withdraw_method=method)
+
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+    balance = user[3] if user else 0.0
+
+    if balance < MIN_WITHDRAWAL:
+        await callback.answer(f"❌ Минимальная сумма вывода: {MIN_WITHDRAWAL}₽", show_alert=True)
+        return
+
+    text = f"""
+<b>📤 Вывод средств</b>
+
+💰 <b>Доступно:</b> {balance:.2f}₽
+💵 <b>Минимальная сумма:</b> {MIN_WITHDRAWAL}₽
+
+Введите сумму для вывода:
+    """
+
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await state.set_state(UserStates.waiting_withdraw_amount)
+
+@dp.message(UserStates.waiting_withdraw_amount)
+async def process_withdraw_amount(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    user = db.get_user(user_id)
+    balance = user[3] if user else 0.0
+
+    try:
+        amount = float(message.text)
+        if amount < MIN_WITHDRAWAL:
+            await message.answer(f"❌ Минимальная сумма вывода: {MIN_WITHDRAWAL}₽")
+            return
+        if amount > balance:
+            await message.answer("❌ Недостаточно средств на балансе")
+            return
+
+        data = await state.get_data()
+        method = data.get('withdraw_method')
+
+        text = f"""
+<b>📤 Подтверждение вывода</b>
+
+💵 <b>Сумма:</b> {amount}₽
+💳 <b>Способ:</b> {method}
+
+Введите реквизиты для вывода:
+        """
+
+        await message.answer(text, parse_mode="HTML")
+        await state.update_data(withdraw_amount=amount)
+        await state.set_state(UserStates.waiting_withdraw_method)
+
+    except ValueError:
+        await message.answer("❌ Введите корректную сумму")
+
+@dp.message(UserStates.waiting_withdraw_method)
+async def process_withdraw_details(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    data = await state.get_data()
+    amount = data.get('withdraw_amount')
+    method = data.get('withdraw_method')
+    details = message.text
+
+    withdrawal_id = db.add_withdrawal_request(user_id, amount, method, details)
+    db.update_balance(user_id, -amount)
+    db.add_operation(user_id, "withdrawal_request", amount)
+
+    await message.answer(f"✅ Заявка на вывод {amount}₽ создана. Ожидайте обработки администратором.")
+
+    admin_text = f"""
+<b>📤 Новая заявка на вывод #{withdrawal_id}</b>
+
+👤 <b>Пользователь:</b> {message.from_user.first_name} (@{message.from_user.username})
+🆔 <b>ID:</b> {user_id}
+💵 <b>Сумма:</b> {amount}₽
+💳 <b>Способ:</b> {method}
+📋 <b>Реквизиты:</b> {details}
+    """
+
+    await bot.send_message(ADMIN_ID, admin_text, reply_markup=get_withdrawal_actions_keyboard(withdrawal_id), parse_mode="HTML")
+
+    await state.clear()
+
+# Обработчики настроек
+@dp.callback_query(lambda c: c.data == "statistics")
+async def statistics_callback(callback: types.CallbackQuery):
+    if not await check_user_access(callback):
+        return
+        
+    total_users = db.get_users_count()
+    active_investors = db.get_active_investors_count()
+    new_users_24h = db.get_new_users_last_24h()
+    online_now = db.get_online_users_count()
+    total_invested = db.get_total_invested()
+    total_earned = db.get_total_earned()
+    days_working = get_days_working()
+
+    text = f"""
+<b>📊 Реальная статистика бота:</b>
+
+👥 <b>Всего пользователей:</b> {total_users}
+💰 <b>Активных инвесторов:</b> {active_investors}
+🆕 <b>Новых за 24 часа:</b> {new_users_24h}
+🌐 <b>Онлайн сейчас:</b> {online_now}
+
+💵 <b>Общая сумма инвестиций:</b> {total_invested:.2f}₽
+🎯 <b>Общая прибыль пользователей:</b> {total_earned:.2f}₽
+📅 <b>Бот работает:</b> {days_working} дней
+    """
+
+    await callback.message.edit_text(text, reply_markup=get_back_to_settings_keyboard(), parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data == "operations")
+async def operations_callback(callback: types.CallbackQuery):
+    if not await check_user_access(callback):
+        return
+        
+    operations = db.get_recent_operations(10)
+
+    if not operations:
+        text = "📋 <b>Последние операции:</b>\n\nОпераций пока нет"
+    else:
+        text = "📋 <b>Последние операции:</b>\n\n"
+        for op in operations:
+            text += f"• {op[1]}: {op[2]}₽\n"
+
+    await callback.message.edit_text(text, reply_markup=get_back_to_settings_keyboard(), parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data == "notifications")
+async def notifications_callback(callback: types.CallbackQuery):
+    if not await check_user_access(callback):
+        return
+        
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+    notifications_enabled = user[9] if user else 1
+
+    if notifications_enabled:
+        db.update_notifications(user_id, False)
+        status = "❌ Отключены"
+    else:
+        db.update_notifications(user_id, True)
+        status = "✅ Включены"
+
+    text = f"""
+<b>🔔 Настройки уведомлений</b>
+
+Статус уведомлений: {status}
+
+Уведомления включают:
+• Напоминания о сборе прибыли
+• Новости и обновления
+• Партнерские бонусы
+    """
+
+    await callback.message.edit_text(text, reply_markup=get_back_to_settings_keyboard(), parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data == "support")
+async def support_callback(callback: types.CallbackQuery, state: FSMContext):
+    if not await check_user_access(callback):
+        return
+        
+    text = """
+<b>🆘 Связь с поддержкой</b>
+
+Опишите вашу проблему или вопрос:
+
+💡 <b>Примеры:</b>
+• Проблемы с пополнением/выводом
+• Технические неполадки
+• Вопросы по инвестициям
+• Предложения по улучшению
+    """
+
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await state.set_state(UserStates.waiting_support_message)
+
+@dp.message(UserStates.waiting_support_message)
+async def process_support_message(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    support_id = db.add_support_request(user_id, message.text)
+
+    admin_text = f"""
+<b>🆘 Новая заявка в поддержку #{support_id}</b>
+
+👤 <b>Пользователь:</b> {message.from_user.first_name} (@{message.from_user.username})
+🆔 <b>ID:</b> {user_id}
+
+📝 <b>Сообщение:</b>
+{message.text}
+    """
+
+    await bot.send_message(ADMIN_ID, admin_text, reply_markup=get_support_actions_keyboard(support_id), parse_mode="HTML")
+
+    await message.answer("✅ Ваше сообщение отправлено в поддержку. Мы ответим вам в ближайшее время.")
+    await state.clear()
+
+# Обработчики наград за активности
+@dp.callback_query(lambda c: c.data.startswith("reward_"))
+async def reward_type_callback(callback: types.CallbackQuery, state: FSMContext):
+    if not await check_user_access(callback):
+        return
+        
+    reward_type = callback.data.replace("reward_", "")
+    await state.update_data(reward_type=reward_type)
+
+    reward_names = {
+        "post": "📝 Пост в соцсетях",
+        "video": "🎥 Видео-обзор",
+        "story": "✨ Сторис",
+        "review": "⭐ Отзыв"
+    }
+
+    text = f"""
+<b>{reward_names[reward_type]}</b>
+
+💰 <b>Вознаграждение:</b> {REWARD_PRICES[reward_type]}₽
+
+📋 <b>Требования:</b>
+• Упоминание нашего бота
+• Ссылка на бота: https://t.me/{BOT_USERNAME[1:]}
+• Качественный контент
+
+📝 <b>Отправьте ссылку на ваш {reward_names[reward_type].lower()} или описание:</b>
+    """
+
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await state.set_state(UserStates.waiting_reward_proof)
+
+@dp.message(UserStates.waiting_reward_proof)
+async def process_reward_proof(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    reward_type = data.get('reward_type')
+    proof_text = message.text
+
+    reward_names = {
+        "post": "пост в соцсетях",
+        "video": "видео-обзор",
+        "story": "сторис",
+        "review": "отзыв"
+    }
+
+    reward_id = db.add_reward_request(
+        message.from_user.id,
+        reward_type,
+        proof_text,
+        REWARD_PRICES[reward_type]
+    )
+
+    admin_text = f"""
+<b>🎁 Новая заявка на награду #{reward_id}</b>
+
+👤 <b>Пользователь:</b> {message.from_user.first_name} (@{message.from_user.username})
+🆔 <b>ID:</b> {message.from_user.id}
+🎯 <b>Тип:</b> {reward_names[reward_type]}
+💰 <b>Сумма:</b> {REWARD_PRICES[reward_type]}₽
+
+📝 <b>Доказательство:</b>
+{proof_text}
+    """
+
+    await bot.send_message(ADMIN_ID, admin_text, reply_markup=get_reward_actions_keyboard(reward_id), parse_mode="HTML")
+
+    await message.answer(f"✅ Заявка на награду за {reward_names[reward_type]} отправлена! Ожидайте проверки администратора.")
+    await state.clear()
+
+# Админ панель
+@dp.callback_query(lambda c: c.data == "admin_panel")
+async def admin_panel_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    text = "<b>👨‍💼 Панель администратора</b>\n\nВыберите действие:"
+    await callback.message.edit_text(text, reply_markup=get_admin_keyboard(), parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data == "admin_stats")
+async def admin_stats_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    total_users = db.get_users_count()
+    active_investors = db.get_active_investors_count()
+    new_users_24h = db.get_new_users_last_24h()
+    online_now = db.get_online_users_count()
+    total_invested = db.get_total_invested()
+    total_earned = db.get_total_earned()
+    days_working = get_days_working()
+
+    pending_deposits = len(db.get_pending_deposits())
+    pending_withdrawals = len(db.get_pending_withdrawals())
+    pending_support = len(db.get_pending_support_requests())
+    pending_rewards = len(db.get_pending_reward_requests())
+
+    text = f"""
+<b>📊 Расширенная статистика для администратора:</b>
+
+👥 <b>Всего пользователей:</b> {total_users}
+💰 <b>Активных инвесторов:</b> {active_investors}
+🆕 <b>Новых за 24 часа:</b> {new_users_24h}
+🌐 <b>Онлайн сейчас:</b> {online_now}
+
+💵 <b>Общая сумма инвестиций:</b> {total_invested:.2f}₽
+🎯 <b>Общая прибыль пользователей:</b> {total_earned:.2f}₽
+📅 <b>Бот работает:</b> {days_working} дней
+
+📥 <b>Заявок на пополнение:</b> {pending_deposits}
+📤 <b>Заявок на вывод:</b> {pending_withdrawals}
+🆘 <b>Заявок в поддержку:</b> {pending_support}
+🎁 <b>Заявок на награды:</b> {pending_rewards}
+    """
+
+    await callback.message.edit_text(text, reply_markup=get_back_to_admin_keyboard(), parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data == "admin_withdrawals")
+async def admin_withdrawals_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    withdrawals = db.get_pending_withdrawals()
+
+    if not withdrawals:
+        text = "📋 <b>Заявки на вывод:</b>\n\nЗаявок нет"
+        await callback.message.edit_text(text, reply_markup=get_back_to_admin_keyboard(), parse_mode="HTML")
+        return
+
+    text = "📋 <b>Заявки на вывод:</b>\n\n"
+    for w in withdrawals:
+        text += f"🆔 <b>ID заявки:</b> {w[0]}\n"
+        text += f"👤 <b>Пользователь:</b> {w[7]} (@{w[6]})\n"
+        text += f"💵 <b>Сумма:</b> {w[2]}₽\n"
+        text += f"💳 <b>Способ:</b> {w[3]}\n"
+        text += f"📋 <b>Реквизиты:</b> {w[4]}\n"
+        text += f"⏰ <b>Время:</b> {w[5]}\n"
+        text += "────────────────────\n"
+
+    await callback.message.edit_text(text, reply_markup=get_back_to_admin_keyboard(), parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data == "admin_deposit_requests")
+async def admin_deposit_requests_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    deposits = db.get_pending_deposits()
+
+    if not deposits:
+        text = "📥 <b>Заявки на пополнение:</b>\n\nЗаявок нет"
+        await callback.message.edit_text(text, reply_markup=get_back_to_admin_keyboard(), parse_mode="HTML")
+        return
+
+    text = "📥 <b>Заявки на пополнение:</b>\n\n"
+    for d in deposits:
+        text += f"🆔 <b>ID заявки:</b> {d[0]}\n"
+        text += f"👤 <b>Пользователь:</b> {d[4]} (@{d[3]})\n"
+        text += f"💵 <b>Сумма:</b> {d[2]}₽\n"
+        text += f"💳 <b>Способ:</b> {d[3]}\n"
+        text += f"⏰ <b>Время:</b> {d[5]}\n"
+        text += "────────────────────\n"
+
+    await callback.message.edit_text(text, reply_markup=get_back_to_admin_keyboard(), parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data == "admin_support_requests")
+async def admin_support_requests_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    support_requests = db.get_pending_support_requests()
+
+    if not support_requests:
+        text = "🆘 <b>Заявки в поддержку:</b>\n\nЗаявок нет"
+        await callback.message.edit_text(text, reply_markup=get_back_to_admin_keyboard(), parse_mode="HTML")
+        return
+
+    text = "🆘 <b>Заявки в поддержку:</b>\n\n"
+    for sr in support_requests:
+        text += f"🆔 <b>ID заявки:</b> {sr[0]}\n"
+        text += f"👤 <b>Пользователь:</b> {sr[4]} (@{sr[3]})\n"
+        text += f"📝 <b>Сообщение:</b> {sr[2][:100]}...\n"
+        text += f"⏰ <b>Время:</b> {sr[5]}\n"
+        text += "────────────────────\n"
+
+    await callback.message.edit_text(text, reply_markup=get_back_to_admin_keyboard(), parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data == "admin_reward_requests")
+async def admin_reward_requests_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    reward_requests = db.get_pending_reward_requests()
+
+    if not reward_requests:
+        text = "🎁 <b>Заявки на награды:</b>\n\nЗаявок нет"
+        await callback.message.edit_text(text, reply_markup=get_back_to_admin_keyboard(), parse_mode="HTML")
+        return
+
+    reward_names = {
+        "post": "📝 Пост",
+        "video": "🎥 Видео",
+        "story": "✨ Сторис",
+        "review": "⭐ Отзыв"
+    }
+
+    text = "🎁 <b>Заявки на награды:</b>\n\n"
+    for rr in reward_requests:
+        text += f"🆔 <b>ID заявки:</b> {rr[0]}\n"
+        text += f"👤 <b>Пользователь:</b> {rr[5]} (@{rr[4]})\n"
+        text += f"🎯 <b>Тип:</b> {reward_names.get(rr[2], rr[2])}\n"
+        text += f"💰 <b>Сумма:</b> {rr[4]}₽\n"
+        text += f"📝 <b>Доказательство:</b> {rr[3][:50]}...\n"
+        text += f"⏰ <b>Время:</b> {rr[6]}\n"
+        text += "────────────────────\n"
+
+    await callback.message.edit_text(text, reply_markup=get_back_to_admin_keyboard(), parse_mode="HTML")
+
+# Управление пользователями
+@dp.callback_query(lambda c: c.data == "admin_user_management")
+async def admin_user_management_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    text = """
+<b>👤 Управление пользователями</b>
+
+Выберите действие:
+
+• ❄️ Заморозить баланс - пользователь не сможет выводить средства
+• 🔥 Разморозить баланс - снять заморозку
+• 🚫 Заблокировать пользователя - полный запрет на использование бота
+• ✅ Разблокировать пользователя - снять блокировку
+    """
+
+    await callback.message.edit_text(text, reply_markup=get_user_management_keyboard(), parse_mode="HTML")
+
+# Заморозка баланса
+@dp.callback_query(lambda c: c.data == "admin_freeze_user")
+async def admin_freeze_user_callback(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    text = "❄️ <b>Заморозка баланса</b>\n\nВведите ID пользователя:"
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await state.set_state(AdminStates.waiting_freeze_user_id)
+
+@dp.message(AdminStates.waiting_freeze_user_id)
+async def process_freeze_user_id(message: types.Message, state: FSMContext):
+    try:
+        user_id = int(message.text)
+        user = db.get_user(user_id)
+        if not user:
+            await message.answer("❌ Пользователь не найден")
+            return
+
+        await state.update_data(freeze_user_id=user_id)
+        await message.answer(f"👤 Пользователь: {user[2]}\n📝 Введите причину заморозки:")
+        await state.set_state(AdminStates.waiting_freeze_reason)
+
+    except ValueError:
+        await message.answer("❌ Введите корректный ID пользователя")
+
+@dp.message(AdminStates.waiting_freeze_reason)
+async def process_freeze_reason(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    user_id = data.get('freeze_user_id')
+    reason = message.text
+
+    db.freeze_user(user_id, reason)
+
+    await message.answer(f"✅ Баланс пользователя {user_id} заморожен\n📝 Причина: {reason}")
+
+    try:
+        await bot.send_message(
+            user_id,
+            f"❄️ Ваш баланс был заморожен администратором\n📝 Причина: {reason}\n\nДля разблокировки обратитесь в поддержку."
+        )
+    except Exception:
+        pass
+
+    await state.clear()
+
+# Разморозка баланса
+@dp.callback_query(lambda c: c.data == "admin_unfreeze_user")
+async def admin_unfreeze_user_callback(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    text = "🔥 <b>Разморозка баланса</b>\n\nВведите ID пользователя:"
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await state.set_state(AdminStates.waiting_freeze_user_id)
+
+@dp.message(AdminStates.waiting_freeze_user_id)
+async def process_unfreeze_user_id(message: types.Message, state: FSMContext):
+    try:
+        user_id = int(message.text)
+        user = db.get_user(user_id)
+        if not user:
+            await message.answer("❌ Пользователь не найден")
+            return
+
+        if user[12]:  # is_frozen
+            db.unfreeze_user(user_id)
+            await message.answer(f"✅ Баланс пользователя {user_id} разморожен")
+
+            try:
+                await bot.send_message(user_id, "🔥 Ваш баланс был разморожен администратором")
+            except Exception:
+                pass
+        else:
+            await message.answer("ℹ️ Пользователь не был заморожен")
+
+    except ValueError:
+        await message.answer("❌ Введите корректный ID пользователя")
+
+    await state.clear()
+
+# Блокировка пользователя
+@dp.callback_query(lambda c: c.data == "admin_block_user")
+async def admin_block_user_callback(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    text = "🚫 <b>Блокировка пользователя</b>\n\nВведите ID пользователя:"
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await state.set_state(AdminStates.waiting_block_user_id)
+
+@dp.message(AdminStates.waiting_block_user_id)
+async def process_block_user_id(message: types.Message, state: FSMContext):
+    try:
+        user_id = int(message.text)
+        user = db.get_user(user_id)
+        if not user:
+            await message.answer("❌ Пользователь не найден")
+            return
+
+        await state.update_data(block_user_id=user_id)
+        await message.answer(f"👤 Пользователь: {user[2]}\n📝 Введите причину блокировки:")
+        await state.set_state(AdminStates.waiting_block_reason)
+
+    except ValueError:
+        await message.answer("❌ Введите корректный ID пользователя")
+
+@dp.message(AdminStates.waiting_block_reason)
+async def process_block_reason(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    user_id = data.get('block_user_id')
+    reason = message.text
+
+    db.block_user(user_id, reason)
+
+    await message.answer(f"🚫 Пользователь {user_id} заблокирован\n📝 Причина: {reason}")
+
+    try:
+        await bot.send_message(
+            user_id,
+            f"🚫 Ваш аккаунт был заблокирован администратором\n📝 Причина: {reason}\n\nДля разблокировки обратитесь в поддержку."
+        )
+    except Exception:
+        pass
+
+    await state.clear()
+
+# Разблокировка пользователя
+@dp.callback_query(lambda c: c.data == "admin_unblock_user")
+async def admin_unblock_user_callback(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    text = "✅ <b>Разблокировка пользователя</b>\n\nВведите ID пользователя:"
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await state.set_state(AdminStates.waiting_block_user_id)
+
+@dp.message(AdminStates.waiting_block_user_id)
+async def process_unblock_user_id(message: types.Message, state: FSMContext):
+    try:
+        user_id = int(message.text)
+        user = db.get_user(user_id)
+        if not user:
+            await message.answer("❌ Пользователь не найден")
+            return
+
+        if user[11]:  # is_blocked
+            db.unblock_user(user_id)
+            await message.answer(f"✅ Пользователь {user_id} разблокирован")
+
+            try:
+                await bot.send_message(user_id, "✅ Ваш аккаунт был разблокирован администратором")
+            except Exception:
+                pass
+        else:
+            await message.answer("ℹ️ Пользователь не был заблокирован")
+
+    except ValueError:
+        await message.answer("❌ Введите корректный ID пользователя")
+
+    await state.clear()
+
+# Обработчики заявок
+@dp.callback_query(lambda c: c.data.startswith("approve_withdrawal_"))
+async def approve_withdrawal_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    withdrawal_id = int(callback.data.replace("approve_withdrawal_", ""))
+    withdrawal = db.get_withdrawal_by_id(withdrawal_id)
+
+    if withdrawal:
+        db.update_withdrawal_status(withdrawal_id, "approved")
+
+        try:
+            await bot.send_message(
+                withdrawal[1],
+                f"✅ Ваша заявка на вывод {withdrawal[2]}₽ одобрена администратором. Средства будут переведены в ближайшее время."
+            )
+        except Exception as e:
+            print(f"Не удалось отправить уведомление пользователю: {e}")
+
+    await callback.answer("✅ Вывод одобрен", show_alert=True)
+    await callback.message.edit_text("✅ Вывод успешно одобрен", reply_markup=get_back_to_admin_keyboard())
+
+@dp.callback_query(lambda c: c.data.startswith("reject_withdrawal_"))
+async def reject_withdrawal_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    withdrawal_id = int(callback.data.replace("reject_withdrawal_", ""))
+    withdrawal = db.get_withdrawal_by_id(withdrawal_id)
+
+    if withdrawal:
+        db.update_balance(withdrawal[1], withdrawal[2])
+        db.update_withdrawal_status(withdrawal_id, "rejected")
+
+        try:
+            await bot.send_message(
+                withdrawal[1],
+                f"❌ Ваша заявка на вывод {withdrawal[2]}₽ отклонена администратором. Средства возвращены на ваш баланс."
+            )
+        except Exception as e:
+            print(f"Не удалось отправить уведомление пользователю: {e}")
+
+    await callback.answer("❌ Вывод отклонен", show_alert=True)
+    await callback.message.edit_text("❌ Вывод отклонен", reply_markup=get_back_to_admin_keyboard())
+
+@dp.callback_query(lambda c: c.data.startswith("approve_deposit_"))
+async def approve_deposit_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    deposit_id = int(callback.data.replace("approve_deposit_", ""))
+    deposit = db.get_deposit_by_id(deposit_id)
+
+    if deposit:
+        db.update_balance(deposit[1], deposit[2])
+        db.update_deposit_status(deposit_id, "approved")
+        db.add_operation(deposit[1], "deposit", deposit[2])
+
+        try:
+            await bot.send_message(
+                deposit[1],
+                f"✅ Ваш баланс пополнен на {deposit[2]}₽. Заявка №{deposit_id} подтверждена администратором."
+            )
+        except Exception as e:
+            print(f"Не удалось отправить уведомление пользователю: {e}")
+
+    await callback.answer("✅ Пополнение подтверждено", show_alert=True)
+    await callback.message.edit_text("✅ Пополнение подтверждено", reply_markup=get_back_to_admin_keyboard())
+
+@dp.callback_query(lambda c: c.data.startswith("reject_deposit_"))
+async def reject_deposit_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    deposit_id = int(callback.data.replace("reject_deposit_", ""))
+    deposit = db.get_deposit_by_id(deposit_id)
+
+    if deposit:
+        db.update_deposit_status(deposit_id, "rejected")
+
+        try:
+            await bot.send_message(
+                deposit[1],
+                f"❌ Ваша заявка на пополнение №{deposit_id} на сумму {deposit[2]}₽ отклонена администратором. Если вы уже совершили оплату, свяжитесь с поддержкой."
+            )
+        except Exception as e:
+            print(f"Не удалось отправить уведомление пользователю: {e}")
+
+    await callback.answer("❌ Пополнение отклонено", show_alert=True)
+    await callback.message.edit_text("❌ Пополнение отклонено", reply_markup=get_back_to_admin_keyboard())
+
+@dp.callback_query(lambda c: c.data.startswith("approve_support_"))
+async def approve_support_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    request_id = int(callback.data.replace("approve_support_", ""))
+    support_request = db.get_support_request_by_id(request_id)
+
+    if support_request:
+        db.update_support_request_status(request_id, "processed")
+
+        try:
+            await bot.send_message(
+                support_request[1],
+                f"✅ Ваша заявка в поддержку №{request_id} обработана администратором. Спасибо за обращение!"
+            )
+        except Exception as e:
+            print(f"Не удалось отправить уведомление пользователю: {e}")
+
+    await callback.answer("✅ Заявка обработана", show_alert=True)
+    await callback.message.edit_text("✅ Заявка в поддержку обработана", reply_markup=get_back_to_admin_keyboard())
+
+@dp.callback_query(lambda c: c.data.startswith("reject_support_"))
+async def reject_support_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    request_id = int(callback.data.replace("reject_support_", ""))
+    support_request = db.get_support_request_by_id(request_id)
+
+    if support_request:
+        db.update_support_request_status(request_id, "rejected")
+
+        try:
+            await bot.send_message(
+                support_request[1],
+                f"❌ Ваша заявка в поддержку №{request_id} отклонена администратором. Если вопрос остался актуальным, создайте новую заявку."
+            )
+        except Exception as e:
+            print(f"Не удалось отправить уведомление пользователю: {e}")
+
+    await callback.answer("❌ Заявка отклонена", show_alert=True)
+    await callback.message.edit_text("❌ Заявка в поддержку отклонена", reply_markup=get_back_to_admin_keyboard())
+
+@dp.callback_query(lambda c: c.data.startswith("approve_reward_"))
+async def approve_reward_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    request_id = int(callback.data.replace("approve_reward_", ""))
+    reward_request = db.get_reward_request_by_id(request_id)
+
+    if reward_request:
+        db.update_balance(reward_request[1], reward_request[4])
+        db.update_reward_request_status(request_id, "approved")
+        db.add_operation(reward_request[1], "reward", reward_request[4])
+
+        reward_names = {
+            "post": "пост в соцсетях",
+            "video": "видео-обзор",
+            "story": "сторис",
+            "review": "отзыв"
+        }
+
+        try:
+            await bot.send_message(
+                reward_request[1],
+                f"✅ Ваша заявка на награду за {reward_names.get(reward_request[2], reward_request[2])} одобрена! На ваш баланс зачислено {reward_request[4]}₽."
+            )
+        except Exception as e:
+            print(f"Не удалось отправить уведомление пользователю: {e}")
+
+    await callback.answer("✅ Награда выплачена", show_alert=True)
+    await callback.message.edit_text("✅ Награда успешно выплачена", reply_markup=get_back_to_admin_keyboard())
+
+@dp.callback_query(lambda c: c.data.startswith("reject_reward_"))
+async def reject_reward_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    request_id = int(callback.data.replace("reject_reward_", ""))
+    reward_request = db.get_reward_request_by_id(request_id)
+
+    if reward_request:
+        db.update_reward_request_status(request_id, "rejected")
+
+        reward_names = {
+            "post": "пост в соцсетях",
+            "video": "видео-обзор",
+            "story": "сторис",
+            "review": "отзыв"
+        }
+
+        try:
+            await bot.send_message(
+                reward_request[1],
+                f"❌ Ваша заявка на награду за {reward_names.get(reward_request[2], reward_request[2])} отклонена администратором. Проверьте выполнение требований и попробуйте снова."
+            )
+        except Exception as e:
+            print(f"Не удалось отправить уведомление пользователю: {e}")
+
+    await callback.answer("❌ Награда отклонена", show_alert=True)
+    await callback.message.edit_text("❌ Награда отклонена", reply_markup=get_back_to_admin_keyboard())
+
+@dp.callback_query(lambda c: c.data == "admin_broadcast")
+async def admin_broadcast_callback(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    text = "📢 <b>Рассылка сообщений</b>\n\nВведите сообщение для рассылки всем пользователям:"
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await state.set_state(AdminStates.waiting_broadcast)
+
+@dp.message(AdminStates.waiting_broadcast)
+async def process_broadcast(message: types.Message, state: FSMContext):
+    users = db.get_all_users()
+    success = 0
+    failed = 0
+
+    for user_id in users:
+        try:
+            await bot.send_message(user_id, message.text, parse_mode="HTML")
+            success += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.1)
+
+    await message.answer(f"✅ Рассылка завершена:\nУспешно: {success}\nНе удалось: {failed}")
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data == "admin_deposit")
+async def admin_deposit_callback(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    text = "💳 <b>Пополнение баланса пользователя</b>\n\nВведите ID пользователя:"
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await state.set_state(AdminStates.waiting_deposit_user_id)
+
+@dp.message(AdminStates.waiting_deposit_user_id)
+async def process_deposit_user_id(message: types.Message, state: FSMContext):
+    try:
+        user_id = int(message.text)
+        user = db.get_user(user_id)
+        if not user:
+            await message.answer("❌ Пользователь не найден")
+            return
+
+        await state.update_data(deposit_user_id=user_id)
+        await message.answer(f"👤 Пользователь: {user[2]}\n💵 Введите сумму для пополнения:")
+        await state.set_state(AdminStates.waiting_deposit_amount)
+
+    except ValueError:
+        await message.answer("❌ Введите корректный ID пользователя")
+
+@dp.message(AdminStates.waiting_deposit_amount)
+async def process_deposit_amount_admin(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text)
+        data = await state.get_data()
+        user_id = data.get('deposit_user_id')
+
+        db.update_balance(user_id, amount)
+        db.add_operation(user_id, "admin_deposit", amount)
+
+        await message.answer(f"✅ Баланс пользователя {user_id} пополнен на {amount}₽")
+
+        try:
+            await bot.send_message(user_id, f"✅ Ваш баланс пополнен администратором на {amount}₽")
+        except Exception:
+            pass
+
+        await state.clear()
+
+    except ValueError:
+        await message.answer("❌ Введите корректную сумму")
+
+# Управление настройками бота
+@dp.callback_query(lambda c: c.data == "admin_management")
+async def admin_management_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    text = """
+<b>⚙️ Управление настройками бота</b>
+
+Выберите настройку для изменения:
+
+• <b>Основные:</b> токен бота, ID администратора
+• <b>Финансовые:</b> минимальные суммы, проценты
+• <b>Каналы:</b> обязательная подписка
+• <b>Реквизиты:</b> данные для оплаты
+• <b>Награды:</b> вознаграждения за активности
+    """
+
+    await callback.message.edit_text(text, reply_markup=get_management_keyboard(), parse_mode="HTML")
+
+# Основные callback обработчики
+@dp.callback_query(lambda c: c.data == "back_to_main")
+async def back_to_main(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id in active_timers:
+        active_timers[user_id] = False
+
+    await callback.message.delete()
+    welcome_text = f"""
+<b>🤖 Добро пожаловать, {callback.from_user.first_name}!</b>
+
+💼 <b>Это автоматическая инвестиционная система с ежедневным доходом.</b>
+
+📈 <b>Начните инвестировать и получайте стабильную прибыль!</b>
+
+👇 <b>Выберите раздел в меню:</b>
+    """
+    await callback.message.answer(welcome_text, reply_markup=get_main_keyboard(), parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data == "back_to_wallet")
+async def back_to_wallet(callback: types.CallbackQuery):
+    if not await check_user_access(callback):
+        return
+        
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+
+    balance = user[3] if user else 0.0
+    ref_balance = user[4] if user else 0.0
+    referrals_count = user[8] if user else 0
+
+    text = f"""
+<b>🆔 Ваш ID:</b> {user_id}
+
+💰 <b>Ваш баланс:</b> {balance:.2f}₽
+
+💳 <b>Партнерский баланс:</b> {ref_balance:.2f}₽
+👥 <b>Партнеров:</b> {referrals_count} чел.
+    """
+
+    await callback.message.edit_text(text, reply_markup=get_wallet_keyboard(), parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data == "back_to_settings")
+async def back_to_settings(callback: types.CallbackQuery):
+    if not await check_user_access(callback):
+        return
+        
+    days_working = get_days_working()
+    total_investors = db.get_active_investors_count()
+    new_investors_24h = db.get_new_users_last_24h()
+    online_now = db.get_online_users_count()
+
+    text = f"""
+<b>▪️ Вы попали в раздел настройки бота, здесь вы можете посмотреть статистику, а также узнать информацию или отключить уведомления.</b>
+
+🌐 <b>Дней работаем:</b> {days_working}
+▪️ <b>Всего инвесторов:</b> {total_investors}
+▪️ <b>Новых за 24 часа:</b> {new_investors_24h}
+▪️ <b>Онлайн:</b> {online_now}
+    """
+
+    await callback.message.edit_text(text, reply_markup=get_settings_keyboard(), parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data == "admin_panel")
+async def admin_panel_back(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    text = "<b>👨‍💼 Панель администратора</b>\n\nВыберите действие:"
+    await callback.message.edit_text(text, reply_markup=get_admin_keyboard(), parse_mode="HTML")
+
+# Запуск бота
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    print("🤖 Бот запускается...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
